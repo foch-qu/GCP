@@ -1,0 +1,5 @@
+flask==2.3.3
+gunicorn==21.2.0
+python-json-logger==2.0.7
+google-cloud-logging==3.8.0
+requests==2.31.0
