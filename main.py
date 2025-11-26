@@ -15,64 +15,86 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-@app.route('/healthz', methods=['GET'])
+@app.route('/', methods=['GET', 'POST', 'OPTIONS'])
+def handle_root():
+    """处理根路径的所有请求"""
+    if request.method == 'GET':
+        return jsonify({
+            "service": "Nginx Log Processor",
+            "version": "1.0.0",
+            "status": "running",
+            "timestamp": datetime.utcnow().isoformat(),
+            "endpoints": {
+                "health_check": "/healthz (GET)",
+                "log_receiver": "/ (POST)",
+                "service_info": "/ (GET)"
+            },
+            "usage": {
+                "GET": "Get service information",
+                "POST": "Send nginx logs in JSON format"
+            }
+        })
+    
+    elif request.method == 'POST':
+        return handle_nginx_log()
+    
+    elif request.method == 'OPTIONS':
+        return '', 200
+
+@app.route('/healthz', methods=['GET', 'OPTIONS'])
 def health_check():
-    """健康检查端点 - 只允许 GET 方法"""
+    """健康检查端点"""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     return jsonify({
         "status": "healthy", 
         "timestamp": datetime.utcnow().isoformat(),
         "service": "nginx-log-processor"
     })
 
-@app.route('/', methods=['GET', 'POST'])
-def handle_requests():
-    """
-    处理根路径的请求
-    GET: 返回服务信息
-    POST: 处理 Nginx 日志
-    """
-    if request.method == 'GET':
-        return jsonify({
-            "service": "Nginx Log Processor",
-            "version": "1.0.0",
-            "endpoints": {
-                "health_check": "/healthz (GET)",
-                "log_receiver": "/ (POST)"
-            },
-            "usage": "Send POST requests with nginx logs in JSON format"
-        })
-    
-    elif request.method == 'POST':
-        return handle_nginx_log()
+@app.route('/logs', methods=['POST', 'OPTIONS'])
+def handle_logs():
+    """专门的日志接收端点"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    return handle_nginx_log()
 
 def handle_nginx_log():
     """处理 Nginx 日志 POST 请求"""
     try:
         logger.info(f"Received {request.method} request from {request.remote_addr}")
         
+        # 检查内容类型
         content_type = request.headers.get('Content-Type', '')
         
-        if 'application/json' in content_type:
-            data = request.get_json()
+        if not content_type or 'application/json' not in content_type:
+            return jsonify({
+                "error": "Unsupported Content-Type", 
+                "required": "application/json",
+                "received": content_type
+            }), 400
+        
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "Empty JSON body"}), 400
             
-            if not data:
-                return jsonify({"error": "Empty JSON body"}), 400
-                
-            # 处理 Pub/Sub 格式
-            if 'message' in data and isinstance(data['message'], dict) and 'data' in data['message']:
-                return handle_pubsub_format(data)
-            # 处理直接日志格式
-            elif 'message' in data:
-                return handle_direct_format(data)
-            else:
-                logger.warning(f"Unrecognized JSON format: {data}")
-                return jsonify({"error": "Unrecognized JSON format"}), 400
+        logger.info(f"Received data: {json.dumps(data, indent=2)}")
+        
+        # 处理 Pub/Sub 格式
+        if 'message' in data and isinstance(data['message'], dict) and 'data' in data['message']:
+            return handle_pubsub_format(data)
+        # 处理直接日志格式
+        elif 'message' in data:
+            return handle_direct_format(data)
         else:
-            return jsonify({"error": "Unsupported Content-Type, must be application/json"}), 400
+            # 尝试处理其他格式
+            return handle_direct_format(data)
             
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}", exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 def handle_pubsub_format(data):
     """处理 Pub/Sub 格式的消息"""
@@ -86,12 +108,13 @@ def handle_pubsub_format(data):
         return jsonify({
             "status": "success", 
             "source": "pubsub",
-            "message": "Log processed successfully"
+            "message": "Log processed successfully",
+            "timestamp": datetime.utcnow().isoformat()
         }), 200
         
     except Exception as e:
         logger.error(f"Error processing Pub/Sub message: {str(e)}")
-        return jsonify({"error": "Failed to process Pub/Sub message"}), 500
+        return jsonify({"error": f"Failed to process Pub/Sub message: {str(e)}"}), 500
 
 def handle_direct_format(data):
     """处理直接发送的日志格式"""
@@ -100,11 +123,12 @@ def handle_direct_format(data):
         return jsonify({
             "status": "success",
             "source": "direct", 
-            "message": "Log processed successfully"
+            "message": "Log processed successfully",
+            "timestamp": datetime.utcnow().isoformat()
         }), 200
     except Exception as e:
         logger.error(f"Error processing direct log: {str(e)}")
-        return jsonify({"error": "Failed to process log"}), 500
+        return jsonify({"error": f"Failed to process log: {str(e)}"}), 500
 
 def process_log_entry(log_entry, source):
     """处理日志条目的核心逻辑"""
@@ -134,29 +158,28 @@ def process_log_entry(log_entry, source):
                 'source': source,
                 'pod': log_entry.get('pod'),
                 'namespace': log_entry.get('namespace'),
-                'message': log_entry.get('message')
+                'message': log_entry.get('message'),
+                'raw_data': log_entry
             }
         
         # 解析 Nginx 日志（如果是文本格式）
-        if isinstance(processed_log.get('message'), str):
-            parsed_nginx = parse_nginx_log(processed_log['message'])
-            if parsed_nginx:
-                processed_log['parsed_nginx'] = parsed_nginx
-                
-        if isinstance(processed_log.get('payload'), str):
-            parsed_nginx = parse_nginx_log(processed_log['payload'])
+        log_text = processed_log.get('message') or processed_log.get('payload')
+        if isinstance(log_text, str):
+            parsed_nginx = parse_nginx_log(log_text)
             if parsed_nginx:
                 processed_log['parsed_nginx'] = parsed_nginx
         
         # 记录处理后的日志
-        logger.info(f"Processed nginx log: {json.dumps(processed_log, default=str)}")
+        logger.info(f"Processed nginx log from {source}: {json.dumps(processed_log, default=str, indent=2)}")
         
         # 示例业务逻辑：检测错误状态码
         nginx_data = processed_log.get('parsed_nginx', {})
-        if isinstance(nginx_data, dict) and nginx_data.get('status', 0) >= 500:
-            logger.error(f"Detected server error (5xx): {processed_log}")
-        elif isinstance(nginx_data, dict) and nginx_data.get('status', 0) >= 400:
-            logger.warning(f"Detected client error (4xx): {processed_log}")
+        if isinstance(nginx_data, dict):
+            status = nginx_data.get('status', 0)
+            if status >= 500:
+                logger.error(f"🚨 Detected server error (5xx): Status {status}")
+            elif status >= 400:
+                logger.warning(f"⚠️ Detected client error (4xx): Status {status}")
             
     except Exception as e:
         logger.error(f"Error in process_log_entry: {str(e)}")
@@ -197,13 +220,40 @@ def parse_nginx_log(log_line):
     
     return None
 
+# 添加 CORS 支持（如果需要）
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# 错误处理器
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({"error": "Endpoint not found"}), 404
+    return jsonify({
+        "error": "Endpoint not found",
+        "available_endpoints": {
+            "/": ["GET", "POST"],
+            "/healthz": ["GET"],
+            "/logs": ["POST"]
+        }
+    }), 404
 
 @app.errorhandler(405)
 def method_not_allowed(error):
-    return jsonify({"error": "Method not allowed for this endpoint"}), 405
+    return jsonify({
+        "error": "Method not allowed for this endpoint",
+        "requested_method": request.method,
+        "allowed_methods": list(error.valid_methods) if hasattr(error, 'valid_methods') else ["GET", "POST"]
+    }), 405
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    return jsonify({
+        "error": "Internal server error",
+        "message": str(error) if app.debug else "Something went wrong"
+    }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
