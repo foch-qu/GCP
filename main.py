@@ -20,7 +20,7 @@ def handle_root():
     """处理根路径的所有请求"""
     if request.method == 'GET':
         return jsonify({
-            "service": "Nginx Log Processor",
+            "service": "Log Aggregation Service",
             "version": "1.0.0",
             "status": "running",
             "timestamp": datetime.utcnow().isoformat(),
@@ -61,32 +61,59 @@ def handle_logs():
     return handle_nginx_log()
 
 def handle_nginx_log():
-    """处理 Nginx 日志 POST 请求"""
+    """处理 Nginx 日志 POST 请求 - 修复版本"""
     try:
         logger.info(f"Received {request.method} request from {request.remote_addr}")
+        logger.info(f"Content-Type: {request.headers.get('Content-Type')}")
+        logger.info(f"Content-Length: {request.headers.get('Content-Length')}")
         
         # 检查内容类型
         content_type = request.headers.get('Content-Type', '')
         
         if not content_type or 'application/json' not in content_type:
+            logger.warning(f"Unsupported Content-Type: {content_type}")
             return jsonify({
                 "error": "Unsupported Content-Type", 
                 "required": "application/json",
                 "received": content_type
             }), 400
         
-        data = request.get_json()
+        # 更安全的 JSON 解析方式
+        raw_data = request.get_data(as_text=True)
+        logger.info(f"Raw request data: {raw_data[:500]}...")  # 只记录前500字符
         
-        if not data:
+        # 检查是否有数据
+        if not raw_data or raw_data.strip() == '':
+            logger.warning("Empty request body")
             return jsonify({"error": "Empty JSON body"}), 400
-            
-        logger.info(f"Received data: {json.dumps(data, indent=2)}")
         
+        # 手动解析 JSON，提供更好的错误信息
+        try:
+            data = json.loads(raw_data)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {str(e)}")
+            logger.error(f"Problematic data: {raw_data[:200]}")
+            return jsonify({
+                "error": "Invalid JSON format",
+                "details": str(e),
+                "received_data_sample": raw_data[:200]
+            }), 400
+            
+        logger.info(f"Successfully parsed JSON data")
+        
+        # 验证数据格式
+        if not isinstance(data, (dict, list)):
+            logger.warning(f"Invalid data type: {type(data)}")
+            return jsonify({
+                "error": "Data must be JSON object or array",
+                "received_type": str(type(data))
+            }), 400
+            
         # 处理 Pub/Sub 格式
-        if 'message' in data and isinstance(data['message'], dict) and 'data' in data['message']:
+        if isinstance(data, dict) and 'message' in data and isinstance(data['message'], dict) and 'data' in data['message']:
             return handle_pubsub_format(data)
         # 处理直接日志格式
-        elif 'message' in data:
+        elif isinstance(data, dict) and 'message' in data:
             return handle_direct_format(data)
         else:
             # 尝试处理其他格式
@@ -119,7 +146,14 @@ def handle_pubsub_format(data):
 def handle_direct_format(data):
     """处理直接发送的日志格式"""
     try:
-        process_log_entry(data, 'direct')
+        # 如果是数组，处理每个元素
+        if isinstance(data, list):
+            for i, item in enumerate(data):
+                logger.info(f"Processing array item {i}: {item}")
+                process_log_entry(item, 'direct')
+        else:
+            process_log_entry(data, 'direct')
+            
         return jsonify({
             "status": "success",
             "source": "direct", 
@@ -257,5 +291,5 @@ def internal_server_error(error):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    logger.info(f"Starting Nginx Log Processor on port {port}")
+    logger.info(f"Starting Log Aggregation Service on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
